@@ -1,103 +1,183 @@
-// backend.js
-const express = require('express');
-const http = require('http');
 const WebSocket = require('ws');
-const path = require('path');
+const { spawn } = require('child_process');
+const fs = require('fs');
 
-const app = express();
-const server = http.createServer(app);
-const wss = new WebSocket.Server({ server });
+const wss = new WebSocket.Server({ port: 8080 });
 
-const TURN_DURATION = 18000; // 18 seconds
-let clients = new Map();
+let users = new Map(); // socket -> { username }
 let queue = [];
-let currentTurn = null;
+let currentController = null;
+let turnTimer = null;
+let remainingSeconds = 0;
 
-app.use(express.static(path.join(__dirname, 'public')));
-
-function broadcast(obj) {
-  const msg = JSON.stringify(obj);
-  for (const [, ws] of clients) {
-    if (ws.readyState === WebSocket.OPEN) {
-      ws.send(msg);
+function broadcast(type, data) {
+  for (const client of wss.clients) {
+    if (client.readyState === WebSocket.OPEN) {
+      client.send(JSON.stringify({ type, ...data }));
     }
   }
 }
 
-function assignNextTurn() {
+function updateTurnCountdown() {
+  if (!currentController) return;
+
+  remainingSeconds--;
+
+  if (remainingSeconds <= 0) {
+    endTurn();
+  } else {
+    broadcastTurnStatus();
+  }
+}
+
+function broadcastTurnStatus() {
+  for (const client of wss.clients) {
+    if (client.readyState !== WebSocket.OPEN) continue;
+
+    const user = users.get(client);
+    const isController = client === currentController;
+
+    let waitTime = remainingSeconds;
+    if (!isController && queue.includes(client)) {
+      const index = queue.indexOf(client);
+      waitTime = remainingSeconds + index * 18;
+    }
+
+    client.send(
+      JSON.stringify({
+        type: 'turn_update',
+        allowed: isController,
+        seconds: isController ? remainingSeconds : waitTime,
+      })
+    );
+  }
+}
+
+function startTurn() {
   if (queue.length === 0) {
-    currentTurn = null;
+    currentController = null;
+    broadcastTurnStatus();
     return;
   }
 
-  const nextUsername = queue.shift();
-  const ws = clients.get(nextUsername);
+  currentController = queue.shift();
+  remainingSeconds = 18;
 
-  if (!ws || ws.readyState !== WebSocket.OPEN) {
-    assignNextTurn();
-    return;
-  }
+  currentController.send(
+    JSON.stringify({
+      type: 'control',
+      allowed: true,
+      seconds: 18,
+    })
+  );
 
-  currentTurn = nextUsername;
-  broadcast({ type: 'control', allowed: false });
-  ws.send(JSON.stringify({ type: 'control', allowed: true }));
+  broadcast({
+    type: 'chat',
+    username: 'System',
+    message: `${users.get(currentController).username} has control for 18 seconds.`,
+  });
 
-  setTimeout(() => {
-    if (currentTurn === nextUsername) {
-      currentTurn = null;
-      assignNextTurn();
-    }
-  }, TURN_DURATION);
+  broadcastTurnStatus();
+
+  if (turnTimer) clearInterval(turnTimer);
+  turnTimer = setInterval(updateTurnCountdown, 1000);
 }
+
+function endTurn() {
+  if (turnTimer) clearInterval(turnTimer);
+  turnTimer = null;
+  remainingSeconds = 0;
+
+  if (currentController && currentController.readyState === WebSocket.OPEN) {
+    currentController.send(
+      JSON.stringify({
+        type: 'control',
+        allowed: false,
+      })
+    );
+  }
+
+  currentController = null;
+  startTurn();
+}
+
+// Start QEMU from qemu.txt
+const qemuCmd = fs.readFileSync('qemu.txt', 'utf-8').trim();
+if (!qemuCmd) {
+  console.error('Error: qemu.txt is empty or not found.');
+  process.exit(1);
+}
+
+const qemuParts = qemuCmd.split(/\s+/);
+const qemuProcess = spawn(qemuParts[0], qemuParts.slice(1), { stdio: 'inherit' });
+
+qemuProcess.on('exit', (code) => {
+  console.log(`QEMU exited with code ${code}`);
+});
+
+// Start websockify
+const websockify = spawn('websockify', ['--web', 'public/noVNC', '5901', 'localhost:5900'], { stdio: 'inherit' });
+
+websockify.on('exit', (code) => {
+  console.log(`Websockify exited with code ${code}`);
+});
 
 wss.on('connection', (ws) => {
-  let username = '';
+  users.set(ws, { username: null });
 
   ws.on('message', (msg) => {
     let data;
     try {
       data = JSON.parse(msg);
-    } catch (e) {
+    } catch {
       return;
     }
 
     switch (data.type) {
-      case 'set_username': {
-        username = data.username;
-        if (!username || clients.has(username)) {
-          ws.close();
-          return;
-        }
-        clients.set(username, ws);
-        broadcast({ type: 'user_joined', username });
-        queue.push(username);
-        if (!currentTurn) assignNextTurn();
+      case 'set_username':
+        users.get(ws).username = data.username;
+        broadcast('user_joined', { username: data.username });
         break;
-      }
 
-      case 'chat': {
-        if (username) {
-          broadcast({ type: 'chat', username, message: data.message });
+      case 'chat':
+        const username = users.get(ws)?.username || 'Unknown';
+        broadcast('chat', { username, message: data.message });
+        break;
+
+      case 'request_turn':
+        if (ws === currentController || queue.includes(ws)) return;
+        queue.push(ws);
+        if (!currentController) {
+          startTurn();
+        } else {
+          ws.send(JSON.stringify({
+            type: 'chat',
+            username: 'System',
+            message: `You are in queue for control.`,
+          }));
+          broadcastTurnStatus();
         }
         break;
-      }
+
+      case 'end_turn':
+        if (ws === currentController) {
+          endTurn();
+        }
+        break;
     }
   });
 
   ws.on('close', () => {
-    if (username) {
-      clients.delete(username);
-      queue = queue.filter(u => u !== username);
-      if (currentTurn === username) {
-        currentTurn = null;
-        assignNextTurn();
-      }
-      broadcast({ type: 'user_left', username });
+    const user = users.get(ws);
+    users.delete(ws);
+    queue = queue.filter(c => c !== ws);
+    if (ws === currentController) {
+      endTurn();
+    }
+    if (user?.username) {
+      broadcast('user_left', { username: user.username });
     }
   });
 });
 
-const PORT = process.env.PORT || 8080;
-server.listen(PORT, () => {
-  console.log(`Server running at http://localhost:${PORT}`);
-});
+console.log('WebSocket server running on ws://localhost:8080');
