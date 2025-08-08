@@ -1,0 +1,179 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>CollabVM</title>
+  <style>
+    body {
+      font-family: sans-serif;
+      background: #111;
+      color: #fff;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      margin: 0;
+      padding: 0;
+    }
+
+    #screen {
+      width: 640px;
+      height: 480px;
+      background: #000;
+      margin-top: 20px;
+    }
+
+    #chat-container {
+      width: 640px;
+      margin-top: 10px;
+    }
+
+    #chat-log {
+      background: #222;
+      height: 200px;
+      overflow-y: auto;
+      padding: 10px;
+      border: 1px solid #333;
+    }
+
+    #chat-input {
+      display: flex;
+      margin-top: 5px;
+    }
+
+    #chat-input input {
+      flex: 1;
+      padding: 5px;
+      font-size: 14px;
+    }
+
+    #chat-input button {
+      padding: 5px 10px;
+      background: #555;
+      color: #fff;
+      border: none;
+      cursor: pointer;
+    }
+
+    #username-prompt {
+      position: fixed;
+      inset: 0;
+      background: rgba(0,0,0,0.9);
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      flex-direction: column;
+      z-index: 1000;
+    }
+
+    #username-prompt input {
+      padding: 10px;
+      font-size: 16px;
+      margin-top: 10px;
+    }
+
+    #username-prompt button {
+      padding: 10px 20px;
+      margin-top: 10px;
+    }
+  </style>
+</head>
+<body>
+  <div id="username-prompt">
+    <h2>Enter your username:</h2>
+    <input type="text" id="username-input" />
+    <button onclick="setUsername()">Join</button>
+  </div>
+
+  <div id="screen"></div>
+
+  <div id="chat-container">
+    <div id="chat-log"></div>
+    <div id="chat-input">
+      <input type="text" id="chat-message" placeholder="Type a message..." />
+      <button onclick="sendMessage()">Send</button>
+    </div>
+  </div>
+
+  <script type="module">
+  import RFB from './vendor/noVNC/core/rfb.js';
+
+  let rfb;
+  let username = '';
+  let ws;
+
+  function setUsername() {
+    const input = document.getElementById('username-input');
+    username = input.value.trim();
+    if (!username) return;
+
+    document.getElementById('username-prompt').style.display = 'none';
+    startWebSocket();
+    startNoVNC();
+  }
+
+  function startWebSocket() {
+    ws = new WebSocket('ws://localhost:8080');
+
+    ws.onopen = () => {
+      ws.send(JSON.stringify({ type: 'set_username', username }));
+    };
+
+    ws.onmessage = (event) => {
+      const data = JSON.parse(event.data);
+
+      switch (data.type) {
+        case 'chat':
+          appendChat(`${data.username}: ${data.message}`);
+          break;
+
+        case 'user_joined':
+          appendChat(`🟢 ${data.username} joined`);
+          break;
+
+        case 'user_left':
+          appendChat(`🔴 ${data.username} left`);
+          break;
+
+        case 'control':
+          if (data.allowed) {
+            rfb.viewOnly = false;
+            appendChat('🟢 You have control of the VM.');
+          } else {
+            rfb.viewOnly = true;
+          }
+          break;
+      }
+    };
+  }
+
+  function startNoVNC() {
+    const screen = document.getElementById('screen');
+    rfb = new RFB(screen, 'ws://localhost:6080');
+    rfb.viewOnly = true; // Only enable input on control
+    rfb.scaleViewport = true;
+    rfb.background = '#000';
+  }
+
+  function sendMessage() {
+    const input = document.getElementById('chat-message');
+    const msg = input.value.trim();
+    if (msg && ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: 'chat', message: msg }));
+      input.value = '';
+    }
+  }
+
+  function appendChat(msg) {
+    const log = document.getElementById('chat-log');
+    const div = document.createElement('div');
+    div.textContent = msg;
+    log.appendChild(div);
+    log.scrollTop = log.scrollHeight;
+  }
+
+  window.setUsername = setUsername;
+  window.sendMessage = sendMessage;
+</script>
+
+</body>
+</html>
